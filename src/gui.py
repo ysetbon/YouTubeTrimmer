@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import messagebox, filedialog
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
 from PIL import Image, ImageTk, ImageDraw
 import requests
 import io
@@ -145,12 +147,15 @@ def create_placeholder_thumbnail():
     try:
         draw.text((85, 48), "No Preview", fill="white", anchor="mm", font=None, size=12)
     except TypeError:
+        # Some older Pillow versions don't allow the 'size' parameter in draw.text
         draw.text((80, 43), "No Preview", fill="white")
     photo = ImageTk.PhotoImage(placeholder)
     logging.debug("Created placeholder thumbnail of size 170x96")
     return photo
 
-def run_download_and_trim(url, start_sec, duration_sec, mode, message_label, update_local_list_callback=None):
+def run_download_and_trim(url, start_sec, duration_sec, mode, message_label,
+                          update_local_list_callback=None, complete_callback=None,
+                          progress_callback=None):
     def worker():
         try:
             if start_sec < 0 or duration_sec <= 0:
@@ -161,14 +166,28 @@ def run_download_and_trim(url, start_sec, duration_sec, mode, message_label, upd
             message_label.config(text="Downloading video (MP4)...")
             download_cmd = [
                 "yt-dlp",
+                "--newline",
                 "-f", "bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
                 "-o", "downloaded_video.mp4",
                 url
             ]
-            result = subprocess.run(download_cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                message_label.config(text=f"Error: yt-dlp failed.\n{result.stderr}")
+            proc = subprocess.Popen(download_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                logging.debug("yt-dlp: " + line.strip())
+                # Modified regex pattern to better match progress percentage
+                m = re.search(r'\[download\].*?(\d+(?:\.\d+)?)%', line)
+                if m and progress_callback:
+                    percent = float(m.group(1))
+                    # Use after() to schedule the update on the main thread
+                    message_label.after(1, lambda p=percent: progress_callback(p))
+            proc.stdout.close()
+            proc.wait()
+            if proc.returncode != 0:
+                message_label.config(text="Error: yt-dlp failed during download.")
                 logging.error("yt-dlp command failed.")
                 return
 
@@ -214,6 +233,7 @@ def run_download_and_trim(url, start_sec, duration_sec, mode, message_label, upd
                 "-c:a", "aac",
                 output_filename
             ]
+            
             result = subprocess.run(trim_cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 message_label.config(text=f"Error: FFmpeg trimming failed.\n{result.stderr}")
@@ -223,10 +243,20 @@ def run_download_and_trim(url, start_sec, duration_sec, mode, message_label, upd
             message_label.config(text=f"Success: {output_filename} created!")
             if update_local_list_callback:
                 message_label.after(0, update_local_list_callback)
+            # Move the complete_callback inside the timer to ensure the success message stays
+            if complete_callback:
+                message_label.after(3000, lambda: (
+                    complete_callback(),
+                    message_label.config(text="")
+                ))
+            else:
+                # If no complete_callback, just clear the message
+                message_label.after(3000, lambda: message_label.config(text=""))
         except Exception as e:
             message_label.config(text=f"Error: {e}")
             logging.error("Exception during download and trim.", exc_info=True)
-
+            if complete_callback:
+                message_label.after(0, complete_callback)
     threading.Thread(target=worker, daemon=True).start()
 
 # Main GUI Class
@@ -234,49 +264,72 @@ class YouTubeTrimmerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("YouTube Video Downloader & Trimmer")
-        self.root.geometry("1400x900")  # Increased height for visibility
-        self.root.minsize(1200, 700)    # Minimum size to ensure content fits
+        self.root.geometry("1400x900")
+        self.root.minsize(1200, 700)
         logging.debug("YouTubeTrimmerApp initialized.")
 
         self.source_option = tk.StringVar(value="local")
         self.mode = tk.StringVar(value="duration")
         self.thumbnail_cache = {}
 
-        main_frame = ttk.Frame(root, padding="0", borderwidth=0)
-        main_frame.pack(fill="both", expand=True)
+        # Apply YouTube-inspired style
+        style = ttk.Style()
+        root.configure(background="#FFFFFF")  # Clean white background
+
+        # Default widget styling
+        style.configure("TFrame", background="#FFFFFF")
+        style.configure("TLabel", background="#FFFFFF", foreground="#333333")
+        style.configure("TEntry", fieldbackground="#FFFFFF", foreground="#333333")
+
+        # YouTube-inspired button style
+        style.configure("Modern.TButton",
+                        font=("Helvetica", 12),
+                        padding=10,
+                        background="#FF0000",  # YouTube Red
+                        foreground="#FFFFFF",
+                        borderwidth=0)
+        style.map("Modern.TButton",
+                  background=[("active", "#E60000")],  # Slightly darker red when active
+                  relief=[("pressed", "flat")])
+
+        self.main_frame = ttk.Frame(root, padding="10")
+        self.main_frame.pack(fill="both", expand=True)
 
         # URL Frame
-        url_frame = ttk.LabelFrame(main_frame, text="YouTube Source", padding="5", borderwidth=0)
-        url_frame.pack(fill="x", pady=0)
+        url_frame = ttk.LabelFrame(self.main_frame, text="YouTube Source", padding="5")
+        url_frame.pack(fill="x", pady=5)
         ttk.Label(url_frame, text="YouTube URL:").pack(side="left", padx=5)
         self.url_entry = EntryWithContextMenu(url_frame, width=40)
         self.url_entry.pack(side="left", padx=5)
-        ttk.Button(url_frame, text="Load Thumbnail", command=self.on_load_thumbnail).pack(side="left", padx=5)
+        ttk.Button(url_frame, text="Load Thumbnail", style="Modern.TButton",
+                   command=self.on_load_thumbnail).pack(side="left", padx=5)
 
-        self.thumb_label = tk.Label(main_frame, bg="#d9d9d9")
-        self.thumb_label.pack(pady=0)
+        # Thumbnail preview
+        self.thumb_label = ttk.Label(self.main_frame)
+        self.thumb_label.pack(pady=5)
 
         # Source Selection
-        source_frame = ttk.Frame(main_frame, borderwidth=0)
-        source_frame.pack(fill="x", pady=0)
+        source_frame = ttk.Frame(self.main_frame)
+        source_frame.pack(fill="x", pady=5)
         ttk.Label(source_frame, text="Video Source:").pack(side="left", padx=5)
-        ttk.Radiobutton(source_frame, text="YouTube", variable=self.source_option, value="youtube", command=self.update_source).pack(side="left", padx=5)
-        ttk.Radiobutton(source_frame, text="Local Video", variable=self.source_option, value="local", command=self.update_source).pack(side="left", padx=5)
+        ttk.Radiobutton(source_frame, text="YouTube", variable=self.source_option, value="youtube",
+                        command=self.update_source).pack(side="left", padx=5)
+        ttk.Radiobutton(source_frame, text="Local Video", variable=self.source_option, value="local",
+                        command=self.update_source).pack(side="left", padx=5)
 
         # Local Video Frame
-        self.local_frame = ttk.LabelFrame(main_frame, text="Local Videos", padding="5", borderwidth=0)
-        local_control_frame = ttk.Frame(self.local_frame, borderwidth=0)
-        local_control_frame.pack(fill="x", pady=0)
+        self.local_frame = ttk.LabelFrame(self.main_frame, text="Local Videos", padding="5")
+        local_control_frame = ttk.Frame(self.local_frame)
+        local_control_frame.pack(fill="x", pady=5)
         ttk.Label(local_control_frame, text="Selected File:").pack(side="left", padx=5)
         self.local_file_label = ttk.Label(local_control_frame, text="No file selected", relief="sunken", width=40)
         self.local_file_label.pack(side="left", padx=5)
-        ttk.Button(local_control_frame, text="Browse", command=self.on_browse_file).pack(side="left", padx=5)
+        ttk.Button(local_control_frame, text="Browse", style="Modern.TButton",
+                   command=self.on_browse_file).pack(side="left", padx=5)
 
-        tree_frame = ttk.Frame(self.local_frame, borderwidth=0)
-        tree_frame.pack(fill="both", expand=True, pady=0)
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Custom.Treeview", rowheight=96, background="#d9d9d9", fieldbackground="#d9d9d9", borderwidth=0)
+        tree_frame = ttk.Frame(self.local_frame)
+        tree_frame.pack(fill="both", expand=True, pady=5)
+        style.configure("Custom.Treeview", rowheight=96, font=("Helvetica", 10))
         self.local_tree = ttk.Treeview(
             tree_frame,
             columns=("Filename", "Size"),
@@ -290,22 +343,23 @@ class YouTubeTrimmerApp:
         self.local_tree.column("#0", width=170, anchor="center")
         self.local_tree.column("Filename", width=400, anchor="w")
         self.local_tree.column("Size", width=100, anchor="e")
-        self.local_tree.pack(side="left", fill="both", expand=True, padx=0, pady=0)
-        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.local_tree.yview, style="Vertical.TScrollbar")
-        scrollbar.pack(side="right", fill="y", padx=0, pady=0)
+        self.local_tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.local_tree.yview)
+        scrollbar.pack(side="right", fill="y")
         self.local_tree.configure(yscrollcommand=scrollbar.set)
-        self.local_tree.bind("<<TreeviewSelect>>", self.on_select_local_video)
-        ttk.Button(self.local_frame, text="Refresh List", command=self.update_local_video_list).pack(pady=0)
+        self.local_tree.bind("<Button-1>", self.on_select_local_video)
+        ttk.Button(self.local_frame, text="Refresh List", style="Modern.TButton",
+                   command=self.update_local_video_list).pack(pady=5)
 
         self.local_file_path = ""
         self.update_local_video_list()
 
         # Time Selection Frame
-        self.time_frame = ttk.LabelFrame(main_frame, text="Trim Settings", padding="5", borderwidth=0)
-        self.time_frame.pack(fill="x", pady=0)
+        self.time_frame = ttk.LabelFrame(self.main_frame, text="Trim Settings", padding="5")
+        self.time_frame.pack(fill="x", pady=5)
 
-        st_frame = ttk.Frame(self.time_frame, borderwidth=0)
-        st_frame.pack(fill="x", pady=0)
+        st_frame = ttk.Frame(self.time_frame)
+        st_frame.pack(fill="x", pady=5)
         ttk.Label(st_frame, text="Start Time:").pack(side="left", padx=5)
         self.start_h = ttk.Spinbox(st_frame, from_=0, to=23, width=3)
         self.start_h.set("0")
@@ -320,13 +374,15 @@ class YouTubeTrimmerApp:
         self.start_s.pack(side="left", padx=2)
         ttk.Label(st_frame, text="s").pack(side="left", padx=5)
 
-        mode_frame = ttk.Frame(self.time_frame, borderwidth=0)
-        mode_frame.pack(fill="x", pady=0)
-        ttk.Radiobutton(mode_frame, text="Specify End Time", variable=self.mode, value="end", command=self.update_mode).pack(side="left", padx=5)
-        ttk.Radiobutton(mode_frame, text="Specify Duration", variable=self.mode, value="duration", command=self.update_mode).pack(side="left", padx=5)
+        mode_frame = ttk.Frame(self.time_frame)
+        mode_frame.pack(fill="x", pady=5)
+        ttk.Radiobutton(mode_frame, text="Specify End Time", variable=self.mode, value="end",
+                        command=self.update_mode).pack(side="left", padx=5)
+        ttk.Radiobutton(mode_frame, text="Specify Duration", variable=self.mode, value="duration",
+                        command=self.update_mode).pack(side="left", padx=5)
 
-        self.end_frame = ttk.Frame(self.time_frame, borderwidth=0)
-        self.end_frame.pack(fill="x", pady=0)
+        self.end_frame = ttk.Frame(self.time_frame)
+        self.end_frame.pack(fill="x", pady=5)
         ttk.Label(self.end_frame, text="End Time:").pack(side="left", padx=5)
         self.end_h = ttk.Spinbox(self.end_frame, from_=0, to=23, width=3)
         self.end_h.set("0")
@@ -341,8 +397,8 @@ class YouTubeTrimmerApp:
         self.end_s.pack(side="left", padx=2)
         ttk.Label(self.end_frame, text="s").pack(side="left", padx=5)
 
-        self.duration_frame = ttk.Frame(self.time_frame, borderwidth=0)
-        self.duration_frame.pack(fill="x", pady=0)
+        self.duration_frame = ttk.Frame(self.time_frame)
+        self.duration_frame.pack(fill="x", pady=5)
         ttk.Label(self.duration_frame, text="Duration:").pack(side="left", padx=5)
         self.dur_h = ttk.Spinbox(self.duration_frame, from_=0, to=23, width=3)
         self.dur_h.set("0")
@@ -358,13 +414,23 @@ class YouTubeTrimmerApp:
         ttk.Label(self.duration_frame, text="s").pack(side="left", padx=5)
 
         # Action Frame
-        self.action_frame = ttk.Frame(main_frame, borderwidth=0)
-        self.action_frame.pack(fill="x", pady=5)
-        self.download_button = ttk.Button(self.action_frame, text="Download and Trim", command=self.on_download_and_trim)
-        self.download_button.pack(side="top", padx=5, pady=5)
+        self.action_frame = ttk.Frame(self.main_frame)
+        self.action_frame.pack(fill="x", pady=10)
+        self.download_button = ttk.Button(self.action_frame, text="Download and Trim", style="Modern.TButton",
+                                          command=self.on_download_and_trim)
+        self.download_button.pack(side="top", pady=5)
 
-        self.message_label = ttk.Label(main_frame, text="", foreground="blue", background="#d9d9d9")
-        self.message_label.pack(pady=0)
+        # Create a frame for the progress section
+        self.progress_frame = ttk.Frame(self.main_frame)
+        self.progress_frame.pack(fill="x", pady=5)
+        
+        # Initialize message label in the progress frame
+        self.message_label = ttk.Label(self.progress_frame, text="", bootstyle="info")
+        self.message_label.pack(pady=5)
+        
+        # Initialize progress bar as None
+        self.progress_bar = None
+        self.progress_label = None
 
         self.update_mode()
         self.update_source()
@@ -409,9 +475,32 @@ class YouTubeTrimmerApp:
                 if duration_sec <= 0:
                     messagebox.showerror("Error", "Duration must be > 0.")
                     return
-            self.message_label.config(text="Starting download & trim...")
-            run_download_and_trim(url, start_sec, duration_sec, self.mode.get(), self.message_label,
-                                  update_local_list_callback=self.update_local_video_list)
+            
+            # Clear any existing progress bar
+            self.stop_progress_bar()
+            
+            # Update message and start progress bar
+            self.message_label.config(text="Starting download...")
+            self.start_progress_bar(determinate=True)
+            
+            def update_progress(percent):
+                if hasattr(self, "progress_bar") and self.progress_bar:
+                    self.progress_bar["value"] = percent
+                    if hasattr(self, "progress_label") and self.progress_label:
+                        self.progress_label.config(text=f"{percent:.1f}%")
+                    # Force update the GUI
+                    self.root.update_idletasks()
+            
+            run_download_and_trim(
+                url,
+                start_sec,
+                duration_sec,
+                self.mode.get(),
+                self.message_label,
+                update_local_list_callback=self.update_local_video_list,
+                complete_callback=self.stop_progress_bar,
+                progress_callback=update_progress
+            )
 
         elif self.source_option.get() == "local":
             if not self.local_file_path:
@@ -436,6 +525,7 @@ class YouTubeTrimmerApp:
                     messagebox.showerror("Error", "Duration must be > 0.")
                     return
             self.message_label.config(text="Starting trim on local video...")
+            self.start_progress_bar(determinate=True)
 
             def worker():
                 try:
@@ -471,16 +561,20 @@ class YouTubeTrimmerApp:
                 except Exception as e:
                     self.message_label.config(text=f"Error: {e}")
                     logging.error("Exception during local video trimming.", exc_info=True)
+                finally:
+                    self.root.after(0, self.stop_progress_bar)
             threading.Thread(target=worker, daemon=True).start()
 
     def update_source(self):
+        # Always show both sections so the window displays everything.
+        self.url_entry.config(state="normal")
+        # Ensure the local_frame is visible.
+        if not self.local_frame.winfo_ismapped():
+            self.local_frame.pack(fill="x", pady=5)
+        # Update the button text based on the selected source.
         if self.source_option.get() == "youtube":
-            self.url_entry.config(state="normal")
-            self.local_frame.pack_forget()
             self.download_button.config(text="Download and Trim")
         else:
-            self.url_entry.config(state="disabled")
-            self.local_frame.pack(fill="x", pady=0, before=self.time_frame)
             self.download_button.config(text="Trim Local Video")
 
     def on_browse_file(self):
@@ -493,12 +587,22 @@ class YouTubeTrimmerApp:
             self.local_file_label.config(text=os.path.basename(file_path))
 
     def on_select_local_video(self, event):
-        selection = self.local_tree.selection()
-        if selection:
-            item = selection[0]
+        item = self.local_tree.identify_row(event.y)
+        if not item:
+            return "break"
+        if item in self.local_tree.selection():
+            self.local_tree.selection_remove(item)
+            self.local_file_path = ""
+            self.local_file_label.config(text="No file selected")
+        else:
+            # Clear any existing selection, then select and focus the clicked item
+            self.local_tree.selection_remove(self.local_tree.selection())
+            self.local_tree.selection_set(item)
+            self.local_tree.focus(item)
             file = self.local_tree.item(item, "values")[0]
             self.local_file_path = os.path.abspath(file)
             self.local_file_label.config(text=file)
+        return "break"
 
     def update_local_video_list(self):
         allowed_ext = ('.mp4', '.mkv', '.avi', '.mov')
@@ -528,9 +632,49 @@ class YouTubeTrimmerApp:
         except Exception as e:
             logging.error("Failed to update local video list.", exc_info=True)
 
+    def start_progress_bar(self, determinate=False):
+        # Remove any existing progress bar and label
+        if hasattr(self, "progress_bar") and self.progress_bar:
+            self.progress_bar.destroy()
+        if hasattr(self, "progress_label") and self.progress_label:
+            self.progress_label.destroy()
+
+        # Create new progress bar in the progress frame
+        self.progress_bar = ttk.Progressbar(
+            self.progress_frame,
+            mode="determinate" if determinate else "indeterminate",
+            length=300
+        )
+        self.progress_bar.pack(fill="x", padx=10, pady=5)
+
+        if determinate:
+            self.progress_bar["maximum"] = 100
+            self.progress_bar["value"] = 0
+            self.progress_label = ttk.Label(self.progress_frame, text="0%")
+            self.progress_label.pack(pady=2)
+        else:
+            self.progress_bar.start(10)
+
+    def stop_progress_bar(self):
+        if hasattr(self, "progress_bar") and self.progress_bar:
+            if self.progress_bar.cget("mode") == "indeterminate":
+                self.progress_bar.stop()
+            self.progress_bar.destroy()
+            self.progress_bar = None
+        
+        if hasattr(self, "progress_label") and self.progress_label:
+            self.progress_label.destroy()
+            self.progress_label = None
+
+    def update_progress_bar(self, percent):
+        if self.progress_bar and self.progress_bar.cget("mode") == "determinate":
+            self.progress_bar["value"] = percent
+        if hasattr(self, "progress_label") and self.progress_label is not None:
+            self.progress_label.config(text=f"{percent:.1f}%")
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    logging.debug("Starting YouTubeTrimmerApp...")
+    root = ttk.Window(themename="flatly")  # Using ttkbootstrap window with a base theme
+    logging.debug("Starting YouTubeTrimmerApp with ttkbootstrap theme...")
     try:
         subprocess.run(["ffmpeg", "-version"], check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -538,4 +682,12 @@ if __name__ == "__main__":
         root.destroy()
     else:
         app = YouTubeTrimmerApp(root)
+        # Center the window on the screen
+        width, height = 1400, 900
+        root.update_idletasks()  # Ensure the window has been drawn
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        root.geometry(f"{width}x{height}+{x}+{y}")
         root.mainloop()
